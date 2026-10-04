@@ -198,31 +198,31 @@ switch 的依赖闭包不包含这两个字体包、字体提取 VM 或 ISO。
 word365
 ```
 
-在首次出现的登录界面中完成账户登录。旧流程中可能随后出现「出错了。(9zeuw)」或 “Microsoft 365 sign-in could not be completed”。若遇到这个对话框，点击「关闭」，然后关闭 Word，继续下一步。
+在首次出现的登录界面中完成账户登录。登录后可能出现「出错了。(9zeuw)」或 “Microsoft 365 sign-in could not be completed”。若遇到这个对话框，点击「关闭」，然后关闭 Word，继续下一步。
 
 ![首次登录后可能出现的 9zeuw 对话框](docs/images/wine4office-word-zh.png)
 
 ### 2. 重新打开 Word
 
-再次运行 `word365`。旧流程中会再次出现「登录后即可开始使用 Word」，点击「登录或创建帐户」。
+再次运行 `word365`。会再次出现「登录后即可开始使用 Word」，点击「登录或创建帐户」。
 
 ![第二次启动 Word 的登录界面](docs/images/wine4office-word-zh-signin.png)
 
 ### 3. 点击「创建一个」
 
-在随后出现的界面中，点击「没有帐户？创建一个!」。这是旧流程在已完成首次登录后触发许可证激活的已验证操作，随后等待许可协议界面出现。
+在随后出现的界面中，点击「没有帐户？创建一个!」。这是在已完成首次登录后触发许可证激活的已验证操作，随后等待许可协议界面出现。
 
 ![登录界面中的创建一个入口](docs/images/wine4office-word-zh-login.png)
 
 ### 4. 接受许可协议
 
-点击「接受」。旧流程中，接受协议后 Word 可能自动退出；此时重新运行 `word365` 即可。
+点击「接受」。接受协议后 Word 可能自动退出；此时重新运行 `word365` 即可。
 
 ![接受 Microsoft 365 许可协议](docs/images/wine4office-word-zh-accept.png)
 
 ### 5. 确认激活状态
 
-重新打开 Word，进入「文件 → 帐户」，确认显示「Microsoft 365」订阅产品及「管理帐户 / 切换许可证 / 更新许可证」。下图是旧流程完成激活后的账户页。
+重新打开 Word，进入「文件 → 帐户」，确认显示「Microsoft 365」订阅产品及「管理帐户 / 切换许可证 / 更新许可证」。下图是完成激活后的账户页。
 
 ![激活后的 Microsoft 365 订阅产品账户页](docs/images/wine4office-word-zh-activated.png)
 
