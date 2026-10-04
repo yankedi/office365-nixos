@@ -37,17 +37,72 @@ FONT_REPLACEMENTS = {
     "宋体": "SimSun", "黑体": "SimHei", "楷体": "KaiTi", "仿宋": "FangSong",
     "等线": "DengXian", "等线 Light": "DengXian Light", "微软雅黑": "Microsoft YaHei",
 }
-CONFIGURATION = """<?xml version="1.0" encoding="utf-8"?>
-<Configuration>
-  <Add OfficeClientEdition="64" Channel="Current">
-    <Product ID="O365BusinessRetail">
-      <Language ID="zh-cn" />
-      <Language ID="en-us" />
-    </Product>
-  </Add>
-  <Display Level="Full" />
-</Configuration>
-"""
+ENGLISH_LANGUAGE = "en-us"
+DEFAULT_LANGUAGES = ("zh-cn", "en-us")
+DEFAULT_LANGUAGE = DEFAULT_LANGUAGES[0]
+
+# Office installs each language into a directory named by its LCID and ODT
+# selects languages by tag. Only the languages listed here can be verified by
+# directory; unknown tags install but are not checked individually.
+LANGUAGE_LCIDS = {
+    "en-us": "1033",
+    "zh-cn": "2052",
+    "zh-tw": "1028",
+    "zh-hk": "3076",
+    "ja-jp": "1041",
+    "ko-kr": "1042",
+    "de-de": "1031",
+    "fr-fr": "1036",
+    "es-es": "3082",
+    "it-it": "1040",
+    "pt-br": "1046",
+    "pt-pt": "2070",
+    "ru-ru": "1049",
+    "pl-pl": "1045",
+    "nl-nl": "1043",
+    "tr-tr": "1055",
+    "sv-se": "1053",
+    "da-dk": "1030",
+    "fi-fi": "1035",
+    "nb-no": "1044",
+    "cs-cz": "1029",
+    "hu-hu": "1038",
+    "el-gr": "1032",
+    "he-il": "1037",
+    "ar-sa": "1025",
+    "th-th": "1054",
+    "vi-vn": "1066",
+    "id-id": "1057",
+    "uk-ua": "1058",
+    "ro-ro": "1048",
+    "ca-es": "1027",
+    "hi-in": "1081",
+    "ms-my": "1086",
+}
+
+
+def language_tag(value):
+    """Normalize an ODT language ID such as zh_TW into zh-tw."""
+    tag = value.strip().lower().replace("_", "-")
+    if not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", tag):
+        raise argparse.ArgumentTypeError("语言标识无效，示例：zh-tw、ja-jp、de-de")
+    return tag
+
+
+def configuration_xml(language):
+    languages = list(dict.fromkeys([language, ENGLISH_LANGUAGE]))
+    entries = "\n".join(f'      <Language ID="{tag}" />' for tag in languages)
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<Configuration>\n"
+        '  <Add OfficeClientEdition="64" Channel="Current">\n'
+        '    <Product ID="O365BusinessRetail">\n'
+        f"{entries}\n"
+        "    </Product>\n"
+        "  </Add>\n"
+        '  <Display Level="Full" />\n'
+        "</Configuration>\n"
+    )
 C2R_TASK_TYPE = re.compile(r'"TaskType"\s*:\s*"([A-Za-z_]+):\{([0-9A-Fa-f-]{36})\}"')
 C2R_TASK_SCENARIO = re.compile(r'"Scenario"\s*:\s*"([^"]+)"')
 C2R_TASK_PROGRESS = re.compile(
@@ -57,9 +112,9 @@ C2R_TASK_PROGRESS = re.compile(
 C2R_TASK_LABELS = {
     "PROMPTUSER": "等待安装器准备",
     "CREATEWORKINGCONFIGURATION": "生成 Office 安装计划",
-    "STREAM": "下载并展开 O365BusinessRetail（zh-cn + en-us）数据",
+    "STREAM": "下载并展开 O365BusinessRetail 数据",
     "STAGEREGISTRY": "暂存 Office 注册表配置",
-    "APPLYCONFIGURATION": "应用 Office 程序和 zh-cn/en-us 语言组件",
+    "APPLYCONFIGURATION": "应用 Office 程序和语言组件",
     "INITUPDATES": "初始化 Click-to-Run 更新组件",
     "INTEGRATE_INSTALL": "集成并注册 Office 应用",
     "UNINSTALLCENTENNIAL": "检查旧版 Store Office",
@@ -358,9 +413,36 @@ class Office:
         print(f"日志：{path}", flush=True)
         return path
 
-    def installed(self):
+    def recorded_languages(self):
+        """Language tags recorded by a previous install, if the marker has them."""
+        try:
+            text = self.marker.read_text(errors="replace")
+        except OSError:
+            return None
+        match = re.search(r"languages=([0-9a-z,._-]+)", text)
+        if not match:
+            return None
+        tokens = [token for token in match.group(1).split(",") if token]
+        # Markers written before language selection stored directory numbers.
+        if not tokens or all(token.isdigit() for token in tokens):
+            return None
+        return tokens
+
+    def language_dirs(self, languages=None):
+        """LCID directories required by the requested or recorded languages."""
+        if languages is None:
+            languages = self.recorded_languages() or list(DEFAULT_LANGUAGES)
+        directories = []
+        for tag in [ENGLISH_LANGUAGE, *languages]:
+            directory = LANGUAGE_LCIDS.get(tag)
+            if directory and directory not in directories:
+                directories.append(directory)
+        return tuple(directories)
+
+    def installed(self, languages=None):
         return ((self.office / "WINWORD.EXE").is_file()
-                and all((self.office / language).is_dir() for language in ("1033", "2052")))
+                and all((self.office / directory).is_dir()
+                        for directory in self.language_dirs(languages)))
 
     def c2r_log_paths(self):
         prefix = self.prefix / "drive_c"
@@ -384,9 +466,16 @@ class Office:
 
         return sorted(paths, key=lambda path: (modified(path), str(path)))
 
-    def verify(self):
-        if not self.installed():
-            raise OfficeError("Office 安装验收失败：需要 WINWORD.EXE、1033 和 2052。")
+    def verify(self, languages=None):
+        if languages is None:
+            languages = self.recorded_languages() or list(DEFAULT_LANGUAGES)
+        if not self.installed(languages):
+            raise OfficeError("Office 安装验收失败：需要 WINWORD.EXE、"
+                              + "、".join(self.language_dirs(languages)) + "。")
+        unmapped = [tag for tag in languages if tag not in LANGUAGE_LCIDS]
+        if unmapped:
+            print(f"注意：{'、'.join(unmapped)} 没有内置的语言目录映射，"
+                  "未逐项验收该语言；请检查安装日志确认。", flush=True)
 
     def uninstall(self):
         with self.lock():
@@ -402,10 +491,13 @@ class Office:
             shutil.rmtree(self.prefix)
             print("Office 已卸载；账户、设置和 prefix 内字体也已删除。", flush=True)
 
-    def write_marker(self, adopted=False):
+    def write_marker(self, languages=None, adopted=False):
+        if languages is None:
+            languages = self.recorded_languages() or list(DEFAULT_LANGUAGES)
         verification = "existing installation verified" if adopted else "ODT exit=0"
         self.marker.write_text(
-            f"{verification}; WINWORD.EXE; languages=1033,2052; {datetime.now().astimezone().isoformat()}\n"
+            f"{verification}; WINWORD.EXE; languages={','.join(languages)}; "
+            f"{datetime.now().astimezone().isoformat()}\n"
         )
 
     def run_wine(self, args, env, log, timeout=120, cwd=None):
@@ -452,7 +544,10 @@ class Office:
             seen = self.application_process_running(executable)
         return returncode, seen
 
-    def init(self, reset=False):
+    def init(self, reset=False, language=None):
+        explicit_language = language is not None
+        language = language or DEFAULT_LANGUAGE
+        languages = list(dict.fromkeys([language, ENGLISH_LANGUAGE]))
         with self.lock():
             if self.prefix.is_symlink():
                 raise OfficeError(f"Prefix 不能是符号链接：{self.prefix}")
@@ -464,8 +559,13 @@ class Office:
                 self.stop_server(env)
                 shutil.rmtree(self.prefix)
             if self.installed():
-                self.write_marker(adopted=True)
-                print(f"已核验现有 Office 安装：{self.prefix}")
+                recorded = self.recorded_languages() or list(DEFAULT_LANGUAGES)
+                if explicit_language and language not in recorded:
+                    raise OfficeError(
+                        "现有安装的语言为 " + "、".join(recorded) + f"，与请求的 {language} 不同；"
+                        "更换语言请先执行 officectl uninstall 或 officectl init --reset。")
+                self.write_marker(recorded, adopted=True)
+                print(f"已核验现有 Office 安装：{self.prefix}（语言：{'、'.join(recorded)}）")
                 return
             if self.prefix.exists() and any(self.prefix.iterdir()):
                 raise OfficeError("Prefix 非空且未通过验收。保留现有文件；使用 officectl init --reset 重建。")
@@ -473,7 +573,7 @@ class Office:
                 raise OfficeError("请在有 X11/XWayland DISPLAY 的图形会话中执行 officectl init。")
             logs = self.log_directory("init")
             xml = logs / "configuration.xml"
-            xml.write_text(CONFIGURATION, encoding="utf-8")
+            xml.write_text(configuration_xml(language), encoding="utf-8")
             self.prefix.parent.mkdir(parents=True, exist_ok=True)
             broker = None
             watcher = None
@@ -511,7 +611,7 @@ class Office:
                     install_env = env.copy()
                     install_env.pop("WAYLAND_DISPLAY", None)
                     install_env.update(WINEDLLOVERRIDES="riched20=n;mshtml=b;winemenubuilder.exe=d", WINE_D3D_CONFIG="renderer=gl")
-                    print("安装 Microsoft 365（64 位，zh-cn + en-us）…", flush=True)
+                    print(f"安装 Microsoft 365（64 位，{' + '.join(languages)}）…", flush=True)
                     progress = InstallProgress(self)
                     progress_stop = threading.Event()
                     progress_thread = threading.Thread(
@@ -529,9 +629,10 @@ class Office:
                         progress_stop.set()
                         progress_thread.join(timeout=5)
                     (logs / "install.exit").write_text("0\n")
-                    self.verify()
-                    self.write_marker()
-                    print(f"安装完成：{self.prefix}\n已验收：ODT exit=0、WINWORD.EXE、1033 + 2052", flush=True)
+                    self.verify(languages)
+                    self.write_marker(languages)
+                    print(f"安装完成：{self.prefix}\n已验收：ODT exit=0、WINWORD.EXE、"
+                          + "、".join(self.language_dirs(languages)), flush=True)
                 finally:
                     stop.set()
                     # Closing stdin releases the broker; no global process kill.
@@ -634,8 +735,10 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(prog="officectl", description="Microsoft 365 安装管理")
     commands = parser.add_subparsers(dest="command", required=True)
-    init = commands.add_parser("init", help="安装默认的 64 位中文版 Office")
+    init = commands.add_parser("init", help="安装 64 位 Office（默认 zh-cn + en-us）")
     init.add_argument("--reset", action="store_true", help="删除默认 prefix 并从零重新安装")
+    init.add_argument("--language", type=language_tag, default=None, metavar="TAG",
+                      help="随英文一起安装的语言 ID，如 zh-tw、ja-jp（默认 zh-cn）")
     commands.add_parser("uninstall", help="卸载 Office 并删除专用 prefix")
     install = commands.add_parser("install", help="安装可选资源")
     install.add_argument("component", choices=["chinese-fonts"])
@@ -658,7 +761,7 @@ def main(argv=None):
             if os.geteuid() == 0:
                 raise OfficeError("请以普通用户执行 officectl，不要使用 sudo。")
             if args.command == "init":
-                office.init(args.reset)
+                office.init(args.reset, args.language)
             elif args.command == "uninstall":
                 office.uninstall()
             else:

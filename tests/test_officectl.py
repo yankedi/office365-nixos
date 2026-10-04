@@ -37,8 +37,8 @@ class OfficeTests(unittest.TestCase):
         }
         self.office = officectl.Office(self.resources, self.env)
 
-    def installed_prefix(self):
-        for language in ("1033", "2052"):
+    def installed_prefix(self, lcids=("1033", "2052")):
+        for language in lcids:
             (self.office.office / language).mkdir(parents=True)
         (self.office.office / "WINWORD.EXE").write_text("test executable")
 
@@ -335,7 +335,7 @@ class OfficeTests(unittest.TestCase):
             ("progress", "STREAM", 20),
         ])
 
-    def simulate_install(self, fail=False):
+    def simulate_install(self, fail=False, language=None, lcids=("1033", "2052")):
         events = []
         broker = Mock()
         broker.stdin.close.side_effect = lambda: events.append("broker-closed")
@@ -365,7 +365,7 @@ class OfficeTests(unittest.TestCase):
                 events.append("odt")
                 if fail:
                     raise officectl.OfficeError("installation failed", 17)
-                self.installed_prefix()
+                self.installed_prefix(lcids)
 
         with patch.object(self.office, "run_wine", side_effect=run_wine), \
                 patch.object(self.office, "stop_server", side_effect=lambda env: events.append("server-stopped")), \
@@ -375,9 +375,9 @@ class OfficeTests(unittest.TestCase):
                 patch.object(officectl.subprocess, "run") as run:
             if fail:
                 with self.assertRaisesRegex(officectl.OfficeError, "installation failed"):
-                    self.office.init()
+                    self.office.init(language=language)
             else:
-                self.office.init()
+                self.office.init(language=language)
             fonts.assert_not_called()
             run.assert_not_called()
         return events
@@ -396,6 +396,45 @@ class OfficeTests(unittest.TestCase):
         self.assertFalse(self.office.marker.exists())
         log = next(self.office.logs.glob("init-*"))
         self.assertEqual((log / "install.exit").read_text(), "17\n")
+
+    def test_language_tags_are_normalized_and_validated(self):
+        self.assertEqual(officectl.language_tag("zh_TW"), "zh-tw")
+        self.assertEqual(officectl.language_tag("JA-jp"), "ja-jp")
+        with self.assertRaises(officectl.argparse.ArgumentTypeError):
+            officectl.language_tag("bad language!")
+
+    def test_init_with_custom_language_installs_english_and_requested_language(self):
+        self.simulate_install(language="zh-tw", lcids=("1033", "1028"))
+        self.assertIn("languages=zh-tw,en-us", self.office.marker.read_text())
+        xml = (next(self.office.logs.glob("init-*")) / "configuration.xml").read_text()
+        self.assertIn('<Language ID="zh-tw" />', xml)
+        self.assertIn('<Language ID="en-us" />', xml)
+        self.assertNotIn("zh-cn", xml)
+
+    def test_existing_install_rejects_a_different_requested_language(self):
+        self.installed_prefix()
+        with patch.object(officectl.subprocess, "run") as run:
+            with self.assertRaisesRegex(officectl.OfficeError, "更换语言"):
+                self.office.init(language="zh-tw")
+            run.assert_not_called()
+
+    def test_existing_install_accepts_a_matching_recorded_language(self):
+        self.installed_prefix()
+        self.office.marker.write_text("ODT exit=0; WINWORD.EXE; languages=zh-tw,en-us; x\n")
+        self.installed_prefix(lcids=("1028",))
+        with patch.object(officectl.subprocess, "run") as run:
+            self.office.init(language="zh-tw")
+            run.assert_not_called()
+        self.assertIn("languages=zh-tw,en-us", self.office.marker.read_text())
+
+    def test_recorded_and_legacy_marker_languages_drive_verification(self):
+        self.installed_prefix()
+        self.office.marker.write_text("ODT exit=0; WINWORD.EXE; languages=1033,2052; x\n")
+        self.assertTrue(self.office.installed())
+        self.office.marker.write_text("ODT exit=0; WINWORD.EXE; languages=zh-tw,en-us; x\n")
+        self.assertFalse(self.office.installed())
+        self.installed_prefix(lcids=("1028",))
+        self.assertTrue(self.office.installed())
 
 
 if __name__ == "__main__":
