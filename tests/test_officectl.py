@@ -23,12 +23,13 @@ class OfficeTests(unittest.TestCase):
             "WINEDLLOVERRIDES": "wrong=n", "WINEBOOTSTRAPMODE": "1", "LOCPATH": "/wrong/locales",
             "LOCALE_ARCHIVE_2_27": "/wrong/host-archive",
             "WAYLAND_DISPLAY": "wayland-1",
+            "FONTCONFIG_FILE": "/etc/fonts/fonts.conf",
+            "FONTCONFIG_PATH": "/etc/fonts",
         }
         self.resources = {
             "wine": "/wine/bin/wine", "wineserver": "/wine/bin/wineserver", "broker": "/broker.exe",
             "odt": "/odt/setup.exe", "shadows": "/office-shadows.exe", "localeArchive": "/locales/locale-archive",
             "libraryPath": "/runtime/libs", "executablePath": "/runtime/bin", "notify": "/notify-send",
-            "fontConfig": "/runtime/fonts.conf",
             "nix": "/nix", "fontFlake": "github:example/fonts/pinned", "runnerVersion": "test",
             "applications": {"word": {"name": "Word", "executable": "WINWORD.EXE"}},
         }
@@ -48,6 +49,8 @@ class OfficeTests(unittest.TestCase):
         for key in ("LD_LIBRARY_PATH", "WINEBOOTSTRAPMODE", "LOCPATH", "WAYLAND_DISPLAY"):
             self.assertNotIn(key, env)
         self.assertEqual(env["WINEDLLOVERRIDES"], "winemenubuilder.exe=d")
+        self.assertEqual(env["FONTCONFIG_FILE"], "/etc/fonts/fonts.conf")
+        self.assertEqual(env["FONTCONFIG_PATH"], "/etc/fonts")
 
     def test_application_environment_is_pinned_and_chinese(self):
         env = self.office.environment(application=True)
@@ -109,6 +112,30 @@ class OfficeTests(unittest.TestCase):
             stop.assert_not_called()
         self.assertTrue(self.office.installed())
 
+    def test_uninstall_removes_only_default_prefix_and_stops_its_server(self):
+        self.installed_prefix()
+        fonts = self.office.prefix / "drive_c/windows/Fonts"
+        fonts.mkdir(parents=True)
+        (fonts / "simsun.ttc").write_text("font")
+        other = self.root / "data/wineprefixes/other"
+        other.mkdir()
+        (other / "keep").write_text("keep")
+        with patch.object(self.office, "stop_server") as stop:
+            self.office.uninstall()
+            stop.assert_called_once()
+        self.assertFalse(self.office.prefix.exists())
+        self.assertEqual((other / "keep").read_text(), "keep")
+
+    def test_uninstall_refuses_prefix_symlink(self):
+        destination = self.root / "other"
+        destination.mkdir()
+        (destination / "keep").write_text("keep")
+        self.office.prefix.parent.mkdir(parents=True)
+        self.office.prefix.symlink_to(destination)
+        with self.assertRaisesRegex(officectl.OfficeError, "符号链接"):
+            self.office.uninstall()
+        self.assertEqual((destination / "keep").read_text(), "keep")
+
     def test_prefix_modification_is_locked_while_an_application_is_running(self):
         with self.office.lock(shared=True):
             with self.assertRaisesRegex(officectl.OfficeError, "正在使用"):
@@ -118,10 +145,15 @@ class OfficeTests(unittest.TestCase):
     def test_multiple_unicode_paths_remain_individual_arguments(self):
         self.installed_prefix()
         files = [str(self.root / "中文 空格/文档 '1'.docx"), str(self.root / "第二个.docx")]
-        with patch.object(officectl.subprocess, "Popen"), patch.object(officectl.subprocess, "run") as run:
+        app_process = Mock()
+        app_process.poll.return_value = 0
+        app_process.wait.return_value = 0
+        with patch.object(officectl.subprocess, "Popen", side_effect=[Mock(), app_process]) as popen, \
+                patch.object(officectl.subprocess, "run") as run, \
+                patch.object(self.office, "application_process_running", return_value=False):
             run.return_value.returncode = 0
             self.office.launch("word", files)
-            command = run.call_args.args[0]
+            command = popen.call_args_list[1].args[0]
             self.assertEqual(command[0], "/wine/bin/wine")
             self.assertTrue(command[1].endswith("WINWORD.EXE"))
             self.assertEqual(command[2:], [officectl.windows_path(file) for file in files])
@@ -129,6 +161,29 @@ class OfficeTests(unittest.TestCase):
             configuration = run.call_args_list[0].args[0]
             self.assertEqual(configuration[1:4], ["reg", "add", r"HKCU\Software\Wine\X11 Driver"])
             self.assertIn("UseEGL", configuration)
+
+    def test_word_exit_code_three_is_normal_after_process_was_seen(self):
+        self.installed_prefix()
+        app_process = Mock()
+        app_process.poll.return_value = 3
+        app_process.wait.return_value = 3
+        with patch.object(officectl.subprocess, "Popen", side_effect=[Mock(), app_process]), \
+                patch.object(officectl.subprocess, "run") as run, \
+                patch.object(self.office, "application_process_running", return_value=True):
+            run.return_value.returncode = 0
+            self.office.launch("word", [])
+
+    def test_word_exit_code_three_is_failure_if_process_never_appeared(self):
+        self.installed_prefix()
+        app_process = Mock()
+        app_process.poll.return_value = 3
+        app_process.wait.return_value = 3
+        with patch.object(officectl.subprocess, "Popen", side_effect=[Mock(), app_process]), \
+                patch.object(officectl.subprocess, "run") as run, \
+                patch.object(self.office, "application_process_running", return_value=False):
+            run.return_value.returncode = 0
+            with self.assertRaisesRegex(officectl.OfficeError, "启动失败（3）"):
+                self.office.launch("word", [])
 
     def test_file_uri_is_decoded_once(self):
         path = self.root / "中文 空格/百分号%20.docx"
@@ -144,6 +199,29 @@ class OfficeTests(unittest.TestCase):
                 self.office.install_fonts()
             run.assert_not_called()
 
+    def test_c2r_progress_reads_appended_utf16_log_and_skips_old_attempts(self):
+        log = (self.office.prefix / "drive_c/users/test/AppData/Local/Temp/NIXOS-20261004-1700.log")
+        log.parent.mkdir(parents=True)
+        log.write_bytes(
+            "ScenarioController::UpdateScenarioProgress - total progress is now 12.\n".encode("utf-16le")
+        )
+        progress = officectl.InstallProgress(self.office)
+        with log.open("ab") as stream:
+            stream.write(
+                "ScenarioController::UpdateScenarioProgress - total progress is now 35.\n"
+                "ScenarioController::UpdateScenarioProgress - total progress is now 67.\n".encode("utf-16le")
+            )
+        self.assertEqual(progress.poll(), [35, 67])
+        self.assertEqual(progress.poll(), [])
+        with log.open("ab") as stream:
+            stream.write(
+                "ScenarioController::UpdateScenarioProgress - total progress is now 92.".encode("utf-16le")
+            )
+        self.assertEqual(progress.poll(), [])
+        with log.open("ab") as stream:
+            stream.write("\n".encode("utf-16le"))
+        self.assertEqual(progress.poll(), [92])
+
     def simulate_install(self, fail=False):
         events = []
         broker = Mock()
@@ -152,6 +230,9 @@ class OfficeTests(unittest.TestCase):
         watcher = Mock()
         watcher.start.side_effect = lambda: events.append("watcher-started")
         watcher.join.side_effect = lambda **kwargs: events.append("watcher-joined")
+        progress_watcher = Mock()
+        progress_watcher.start.side_effect = lambda: events.append("progress-started")
+        progress_watcher.join.side_effect = lambda **kwargs: events.append("progress-joined")
 
         def start_broker(command, **kwargs):
             self.assertEqual(command, ["/wine/bin/wine", "/broker.exe"])
@@ -176,7 +257,7 @@ class OfficeTests(unittest.TestCase):
         with patch.object(self.office, "run_wine", side_effect=run_wine), \
                 patch.object(self.office, "stop_server", side_effect=lambda env: events.append("server-stopped")), \
                 patch.object(officectl.subprocess, "Popen", side_effect=start_broker), \
-                patch.object(officectl.threading, "Thread", return_value=watcher), \
+                patch.object(officectl.threading, "Thread", side_effect=[watcher, progress_watcher]), \
                 patch.object(self.office, "install_fonts") as fonts, \
                 patch.object(officectl.subprocess, "run") as run:
             if fail:
@@ -191,7 +272,8 @@ class OfficeTests(unittest.TestCase):
     def test_install_restarts_services_before_helpers_and_keeps_broker_stdin(self):
         events = self.simulate_install()
         self.assertEqual(events, ["wineboot", "server-stopped", "broker-started", "watcher-started",
-                                  "odt", "broker-closed", "watcher-joined", "server-stopped", "broker-waited"])
+                                  "progress-started", "odt", "progress-joined", "broker-closed",
+                                  "watcher-joined", "server-stopped", "broker-waited"])
         self.assertTrue(self.office.marker.is_file())
 
     def test_failed_install_preserves_prefix_and_cleans_up_helpers(self):

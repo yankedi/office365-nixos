@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -47,12 +48,88 @@ CONFIGURATION = """<?xml version="1.0" encoding="utf-8"?>
   <Display Level="Full" />
 </Configuration>
 """
+C2R_TOTAL_PROGRESS = re.compile(
+    r"ScenarioController::UpdateScenarioProgress\s*-\s*total progress is now\s+(\d+)",
+    re.IGNORECASE,
+)
 
 
 class OfficeError(Exception):
     def __init__(self, message, code=1):
         super().__init__(message)
         self.code = code
+
+
+class InstallProgress:
+    """Read Click-to-Run's native ULS logs and report scenario percentages."""
+
+    def __init__(self, office):
+        self.office = office
+        self.offsets = {}
+        self.pending = {}
+        self.last_percent = None
+        # Existing logs belong to prior attempts; only report data appended
+        # after this installation starts, plus newly-created log files.
+        for path in office.c2r_log_paths():
+            try:
+                self.offsets[path] = path.stat().st_size
+            except OSError:
+                continue
+
+    @staticmethod
+    def _decode(data):
+        if data.startswith(b"\xff\xfe"):
+            payload = data[2:]
+            usable = len(payload) & ~1
+            return payload[:usable].decode("utf-16le", errors="replace"), 2 + usable
+        if data.startswith(b"\xfe\xff"):
+            payload = data[2:]
+            usable = len(payload) & ~1
+            return payload[:usable].decode("utf-16be", errors="replace"), 2 + usable
+        if b"\0" in data[:128]:
+            usable = len(data) & ~1
+            return data[:usable].decode("utf-16le", errors="replace"), usable
+        return data.decode("utf-8", errors="replace"), len(data)
+
+    def poll(self):
+        percentages = []
+        for path in self.office.c2r_log_paths():
+            try:
+                size = path.stat().st_size
+                offset = self.offsets.get(path, 0)
+                if size < offset:
+                    offset = 0
+                    self.pending.pop(path, None)
+                with path.open("rb") as stream:
+                    stream.seek(offset)
+                    data = stream.read()
+            except OSError:
+                continue
+            if not data:
+                continue
+
+            text, consumed = self._decode(data)
+            self.offsets[path] = offset + consumed
+            lines = (self.pending.pop(path, "") + text).splitlines(keepends=True)
+            if lines and not lines[-1].endswith(("\n", "\r")):
+                self.pending[path] = lines.pop()
+            for line in lines:
+                match = C2R_TOTAL_PROGRESS.search(line)
+                if not match:
+                    continue
+                percent = int(match.group(1))
+                if 0 <= percent <= 100 and percent != self.last_percent:
+                    self.last_percent = percent
+                    percentages.append(percent)
+        return percentages
+
+    def run(self, stop, interval=1.0):
+        while not stop.is_set():
+            for percent in self.poll():
+                print(f"Office Click-to-Run 总进度：{percent}%", flush=True)
+            stop.wait(interval)
+        for percent in self.poll():
+            print(f"Office Click-to-Run 总进度：{percent}%", flush=True)
 
 
 def windows_path(value):
@@ -98,7 +175,6 @@ class Office:
                 env.pop(key)
         env.update(LOCALE_ARCHIVE=self.resources["localeArchive"],
                    LOCALE_ARCHIVE_2_27=self.resources["localeArchive"])
-        env.update(FONTCONFIG_FILE=self.resources["fontConfig"], FONTCONFIG_PATH="")
         env.update(WINEPREFIX=str(self.prefix), WINEARCH="win64",
                    WINEDEBUG=self.environ.get("WINEDEBUG", "-all"),
                    LANG="zh_CN.UTF-8", LC_ALL="zh_CN.UTF-8",
@@ -134,9 +210,45 @@ class Office:
         return ((self.office / "WINWORD.EXE").is_file()
                 and all((self.office / language).is_dir() for language in ("1033", "2052")))
 
+    def c2r_log_paths(self):
+        prefix = self.prefix / "drive_c"
+        roots = [prefix / "windows"]
+        users = prefix / "users"
+        try:
+            roots.extend(user / "AppData/Local/Temp" for user in users.iterdir() if user.is_dir())
+        except OSError:
+            pass
+        paths = set()
+        for root in roots:
+            try:
+                paths.update(root.glob("NIXOS-*.log"))
+            except OSError:
+                continue
+        def modified(path):
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                return 0
+
+        return sorted(paths, key=lambda path: (modified(path), str(path)))
+
     def verify(self):
         if not self.installed():
             raise OfficeError("Office 安装验收失败：需要 WINWORD.EXE、1033 和 2052。")
+
+    def uninstall(self):
+        with self.lock():
+            if self.prefix.is_symlink():
+                raise OfficeError(f"Prefix 不能是符号链接：{self.prefix}")
+            if not self.prefix.exists():
+                print(f"Office prefix 不存在，无需卸载：{self.prefix}")
+                return
+            if not self.prefix.is_dir():
+                raise OfficeError(f"Office prefix 不是目录，拒绝删除：{self.prefix}")
+            print(f"删除专用 Office prefix：{self.prefix}", flush=True)
+            self.stop_server(self.environment())
+            shutil.rmtree(self.prefix)
+            print("Office 已卸载；账户、设置和 prefix 内字体也已删除。", flush=True)
 
     def write_marker(self, adopted=False):
         verification = "existing installation verified" if adopted else "ODT exit=0"
@@ -156,6 +268,37 @@ class Office:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
         subprocess.run([self.resources["wineserver"], "-w"], env=env, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+
+    def application_process_running(self, executable):
+        expected = executable.casefold()
+        prefix = os.fsencode(f"WINEPREFIX={self.prefix}")
+        try:
+            processes = Path("/proc").iterdir()
+            for process in processes:
+                if not process.name.isdigit():
+                    continue
+                try:
+                    if (process / "comm").read_text().strip().casefold() != expected:
+                        continue
+                    if prefix in (process / "environ").read_bytes().split(b"\0"):
+                        return True
+                except OSError:
+                    continue
+        except OSError:
+            return False
+        return False
+
+    def run_application(self, command, env, log, executable):
+        process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
+        seen = False
+        while process.poll() is None:
+            if not seen:
+                seen = self.application_process_running(executable)
+            time.sleep(0.2)
+        returncode = process.wait()
+        if not seen:
+            seen = self.application_process_running(executable)
+        return returncode, seen
 
     def init(self, reset=False):
         with self.lock():
@@ -217,12 +360,22 @@ class Office:
                     install_env.pop("WAYLAND_DISPLAY", None)
                     install_env.update(WINEDLLOVERRIDES="riched20=n;mshtml=b;winemenubuilder.exe=d", WINE_D3D_CONFIG="renderer=gl")
                     print("安装 Microsoft 365（64 位，zh-cn + en-us）…", flush=True)
+                    progress = InstallProgress(self)
+                    progress_stop = threading.Event()
+                    progress_thread = threading.Thread(
+                        target=progress.run, args=(progress_stop,), daemon=True
+                    )
+                    print("读取 Click-to-Run 安装进度…", flush=True)
+                    progress_thread.start()
                     try:
                         self.run_wine([self.resources["odt"], "/configure", windows_path(str(xml))],
                                       install_env, log, timeout=1800, cwd=logs)
                     except OfficeError as error:
                         (logs / "install.exit").write_text(f"{error.code}\n")
                         raise
+                    finally:
+                        progress_stop.set()
+                        progress_thread.join(timeout=5)
                     (logs / "install.exit").write_text("0\n")
                     self.verify()
                     self.write_marker()
@@ -297,12 +450,17 @@ class Office:
                 subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_shadows"], env=env,
                                  stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                  start_new_session=True)
-                result = subprocess.run([self.resources["wine"],
-                                         "C:\\Program Files\\Microsoft Office\\root\\Office16\\" + app["executable"],
-                                         *arguments], env=env, stdout=log, stderr=subprocess.STDOUT)
-            if result.returncode:
-                raise OfficeError(f"{app['name']} 启动失败（{result.returncode}），日志：{logs}",
-                                  result.returncode if result.returncode > 0 else 128 - result.returncode)
+                returncode, process_seen = self.run_application(
+                    [self.resources["wine"],
+                     "C:\\Program Files\\Microsoft Office\\root\\Office16\\" + app["executable"],
+                     *arguments],
+                    env, log, app["executable"],
+                )
+            # Wine4Office's Word returns Windows exit code 3 on normal close.
+            # Suppress it only when the matching app process actually ran.
+            if returncode and not (returncode == 3 and process_seen):
+                raise OfficeError(f"{app['name']} 启动失败（{returncode}），日志：{logs}",
+                                  returncode if returncode > 0 else 128 - returncode)
 
     def watch_shadows(self):
         if not self.installed():
@@ -326,6 +484,7 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init", help="安装默认的 64 位中文版 Office")
     init.add_argument("--reset", action="store_true", help="删除默认 prefix 并从零重新安装")
+    commands.add_parser("uninstall", help="卸载 Office 并删除专用 prefix")
     install = commands.add_parser("install", help="安装可选资源")
     install.add_argument("component", choices=["chinese-fonts"])
     # Launchers use private dispatch; the public CLI is init/install only.
@@ -348,6 +507,8 @@ def main(argv=None):
                 raise OfficeError("请以普通用户执行 officectl，不要使用 sudo。")
             if args.command == "init":
                 office.init(args.reset)
+            elif args.command == "uninstall":
+                office.uninstall()
             else:
                 office.install_fonts()
         return 0

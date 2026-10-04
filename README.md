@@ -62,6 +62,8 @@ Office 主体由 ODT 在此时联网下载。初始化需要正常的 X11 / XWay
 初始化严格限于安装所需步骤：`wineboot` → 重置并等待 wineserver → broker 保活 / 服务看护 →
 ODT 安装 → 检查退出码、`WINWORD.EXE`、`1033`、`2052` → 清理本次 prefix 的安装进程。
 不安装字体、不启动 Word、不执行登录激活。
+ODT 启动后，`officectl` 会监视 prefix 中的 `NIXOS-*.log`，将 Click-to-Run 报告的安装任务总进度百分比（不是单独的网络字节百分比）实时写到终端；详细原始日志仍保存在 prefix 的 `drive_c/windows/` 和 `drive_c/users/*/AppData/Local/Temp/`。
+启动器保留宿主 Fontconfig 配置，使 NixOS / Home Manager 字体目录中的中日韩字体在 Windows 字体尚未装入 prefix 时也可回退显示。
 
 现有成功安装可直接接管，重复 `init` 只核验。非空但未通过验收的 prefix 会保留。
 显式重建（会删除该 prefix，包括其中的账户和许可证数据）：
@@ -69,6 +71,14 @@ ODT 安装 → 检查退出码、`WINWORD.EXE`、`1033`、`2052` → 清理本�
 ```bash
 officectl init --reset
 ```
+
+卸载 Office 并删除整个默认 prefix（包括账户、许可证、设置及 prefix 内安装的字体）：
+
+```bash
+officectl uninstall
+```
+
+这不会更改 NixOS 声明的 runner、桌面入口或运行库。
 
 ## 独立安装中文字体
 

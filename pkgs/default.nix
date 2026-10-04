@@ -14,22 +14,6 @@ let
   runtime = pkgs.callPackage ./runtime.nix { };
   odt = pkgs.callPackage ./odt.nix { };
   shadows = pkgs.callPackage ./shadows.nix { };
-  # Host Fontconfig rules can use newer syntax than the pinned runtime library.
-  # Use compatible rules while still discovering the host/user font files.
-  fontConfig = pkgs.writeText "office365-fonts.conf" ''
-    <?xml version="1.0"?>
-    <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
-    <fontconfig>
-      <dir>${pkgs.dejavu_fonts}/share/fonts/truetype</dir>
-      <dir>/run/current-system/sw/share/fonts</dir>
-      <dir>/run/current-system/sw/share/X11/fonts</dir>
-      <dir prefix="xdg">fonts</dir>
-      <cachedir prefix="xdg">fontconfig</cachedir>
-      <alias><family>sans-serif</family><prefer><family>DejaVu Sans</family></prefer></alias>
-      <alias><family>serif</family><prefer><family>DejaVu Serif</family></prefer></alias>
-      <alias><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>
-    </fontconfig>
-  '';
   resources = pkgs.writeText "office365-resources.json" (
     builtins.toJSON {
       inherit applications;
@@ -39,7 +23,6 @@ let
       odt = "${odt}/share/odt/setup.exe";
       shadows = "${shadows}/bin/office-shadows.exe";
       localeArchive = "${glibcLocales}/lib/locale/locale-archive";
-      inherit fontConfig;
       libraryPath = lib.makeLibraryPath runtime.runtimeLibraries;
       executablePath = lib.makeBinPath [ samba4 ];
       notify = "${libnotify}/bin/notify-send";
