@@ -2,10 +2,12 @@
 
 在 NixOS 上声明式部署 Microsoft 365 的 Wine 运行资源，并由用户显式管理 Office prefix 和中文字体。
 
+- 语言支持：可用 `officectl init --language <语言 ID>` 选择英文 + 指定语言（默认 `zh-cn`，例如 `zh-tw`、`ja-jp`）；界面语言可在 Office「文件 → 选项 → 语言」中自行切换。除默认的中英文组合外，其他语言尚未经过测试。
+- 激活要求：需使用用户自己的正版 Microsoft 365 授权登录激活。
 - 支持平台：`x86_64-linux`
 - 图形后端：X11 / XWayland
 - Office 运行时：Wine4Office `0.2.2-beta.2`
-- 下载服务修补：从同版本源码重建 `qmgr.dll`，修复分段下载失败时异步读取缓冲区提前释放导致的服务崩溃；详见[下载故障调查与验证](docs/DOWNLOADS.md)。
+- 下载服务修补：从同版本源码重建 `qmgr.dll`，修复分段下载失败时异步读取缓冲区提前释放导致的服务崩溃（上游 issue [#113](https://github.com/ttv20/wine4office/issues/113)）；详见[下载故障调查与验证](docs/DOWNLOADS.md)。
 - NixOS 模块：`programs.office365`
 
 ## 已知问题
@@ -15,6 +17,8 @@
 3. **Word 多页文档滚动性能异常**：多页面下滚动可能明显卡顿。上游 [PR #57：稀疏 Present1 更新](https://github.com/ttv20/wine4office/pull/57) 记录了相关渲染瓶颈：原路径在每次 `Present1` 时复制整个表面，而非仅处理变更及滚动区域，增加局部重绘开销。上游已为符合条件的 WineD3D Vulkan 交换链实现稀疏更新，但 OpenGL 等路径仍保留全量复制。本项目当前使用 WineD3D OpenGL（`renderer=gl`），不在该优化的适用范围内；目前没有在本项目中验证通过的滚动修复方案。
 
 4. **Word 关闭时可能无法正常退出**：在当前 X11 / XWayland 路径下，关闭含有未保存修改的文档时，弹出的保存确认对话框可能难以定位或操作，导致 Word 一直等待确认、无法正常结束。遇到这种情况可手动 `kill` 对应的 `WINWORD.EXE` 进程；未保存的修改可能丢失。
+
+5. **应用启动阶段偶发无响应（界面卡死）**：目前只在应用启动阶段观察到：启动画面可能长时间停住，或刚打开时窗口无响应，且不易稳定复现；应用正常启动完成后，日常使用暂未再遇到。隔离排查抓到的挂死点位于 Wine 把 Office 的 Direct2D 界面转换为 OpenGL 的渲染路径（GL 上下文创建）：`d2d_factory_CreateWicBitmapRenderTarget` → `d3d10` → `dxgi` → `wined3d` → `wglMakeContextCurrentARB`；伴随日志 `MESA-EGL: warning: egl: failed to create dri2 screen`，随后应用全部线程停在 futex / 管道等待，界面冻结。这是上游 Wine / Wine4Office 渲染路径的问题（上游 issue [#114](https://github.com/ttv20/wine4office/issues/114)），目前没有验证通过的修复：软件渲染（llvmpipe）会让 Office 界面渲染不出来，NVIDIA EGL/GLX 环境变量方案尚未完成复测。另外，被强杀的应用会留下“上次启动失败”标记，下次启动可能停在启动画面，等待一个在 Wine 下不渲染的安全模式对话框；可删除注册表 `HKCU\Software\Microsoft\Office\16.0\Word\Resiliency` 后重试。遇到启动无响应时建议先等待片刻，避免频繁强杀。
 
 ## 接入 NixOS
 
@@ -119,32 +123,42 @@ sudo nixos-rebuild switch --flake .#my-host
 officectl init
 ```
 
+安装英文 + 指定语言（默认 `zh-cn`）：
+
+```bash
+officectl init --language zh-tw
+```
+
+`--language` 接受 ODT 语言 ID，不区分大小写，`_` 会转换为 `-`（如 `zh_tw`、`zh-TW` 都会规范为 `zh-tw`）。
+可用的常见取值包括 `zh-tw`、`ja-jp`、`ko-kr`、`de-de`、`fr-fr`、`es-es` 等；除默认的 `zh-cn + en-us` 组合外，其他语言尚未经过测试，如遇到问题请附上安装日志。
+
 默认 prefix 固定按用户环境展开：
 
 ```bash
 WINEPREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/wineprefixes/office365"
 ```
 
-安装 64 位 `O365BusinessRetail`、Current 通道、`zh-cn + en-us`。
+安装 64 位 `O365BusinessRetail`、Current 通道、英文和所选语言（默认 `zh-cn + en-us`）。
 Office 主体由 ODT 在此时联网下载。初始化需要正常的 X11 / XWayland 图形会话和用户 D-Bus。
 
 初始化严格限于安装所需步骤：`wineboot` → 重置并等待 wineserver → broker 保活 / 服务看护 →
-ODT 安装 → 检查退出码、`WINWORD.EXE`、`1033`、`2052` → 清理本次 prefix 的安装进程。
+ODT 安装 → 检查退出码、`WINWORD.EXE` 和对应语言目录 → 清理本次 prefix 的安装进程。
 不安装字体、不启动 Word、不执行登录激活。
 ODT 启动后，`officectl` 会监视 prefix 中的 `NIXOS-*.log`，把当前 Click-to-Run 任务、阶段完成事件和阶段进度写到终端，例如：
 
 ```text
-Office 安装阶段：下载并展开 O365BusinessRetail（zh-cn + en-us）数据…
-  当前阶段进度：下载并展开 O365BusinessRetail（zh-cn + en-us）数据 22%
-Office 阶段结束：下载并展开 O365BusinessRetail（zh-cn + en-us）数据。
-Office 安装阶段：应用 Office 程序和 zh-cn/en-us 语言组件…
+Office 安装阶段：下载并展开 O365BusinessRetail 数据…
+  当前阶段进度：下载并展开 O365BusinessRetail 数据 22%
+Office 阶段结束：下载并展开 O365BusinessRetail 数据。
+Office 安装阶段：应用 Office 程序和语言组件…
 ```
 
 这里显示的是具体安装阶段的进度，不是单独的网络下载字节比例。详细原始日志仍保存在 prefix 的 `drive_c/windows/` 和 `drive_c/users/*/AppData/Local/Temp/`。
 阶段百分比每次增长都会输出；同时显示原生日志中的下载文件名和已完成传输的字节数。连续 20 秒没有新的可显示事件时，会提示正在等待安装器报告新进度，并保留最近报告的阶段百分比。网络流量停止后，安装器仍可能在展开数据、集成应用或注册组件。
 启动器保留宿主 Fontconfig 配置，使 NixOS / Home Manager 字体目录中的中日韩字体在 Windows 字体尚未装入 prefix 时也可回退显示。
 
-现有成功安装可直接接管，重复 `init` 只核验。非空但未通过验收的 prefix 会保留。
+现有成功安装可直接接管，重复 `init` 只核验；若显式传入的 `--language` 与现有安装语言不同，会拒绝并提示先 `officectl uninstall` 或 `officectl init --reset`。
+非空但未通过验收的 prefix 会保留。
 显式重建（会删除该 prefix，包括其中的账户和许可证数据）：
 
 ```bash
@@ -277,3 +291,11 @@ python3 -m unittest discover -s tests -v
 项目代码遵循 GPL-3.0-or-later，见 `LICENSE`。
 阴影助手由此前 `yankedi/office365-linux` 项目的助手迁入，使用 Microsoft KB 2821007 的窗口消息。
 Wine4Office、ODT、Microsoft 365 和 Windows 字体各自遵循上游许可；代码许可不改变这些资源的许可。
+
+## 免责声明
+
+本项目是社区项目，与 Microsoft、WineHQ、CodeWeavers 及 Wine4Office 项目均无隶属、赞助或背书关系。
+Microsoft、Microsoft 365、Office、Windows、Word、Excel、PowerPoint、OneNote 等名称是 Microsoft Corporation 的商标或注册商标；其他名称与商标归各自所有者。
+本项目不包含或分发 Microsoft Office 的安装文件与授权。Office 由微软官方部署工具从微软服务器下载并安装到用户自己的 prefix；用户需自行拥有有效的 Microsoft 365 / Office 授权，并遵守微软的许可条款和当地法律。本项目不提供绕过激活或许可验证的机制。
+中文字体由第三方项目 [`kugland/nix-ttf-ms-win11-auto`](https://github.com/kugland/nix-ttf-ms-win11-auto) 按需从 Windows ISO 提取，本项目不附带或再分发字体文件；字体使用需自行确认相应授权。
+本项目按“原样”提供，不附带任何明示或暗示的担保。安装、登录、激活或使用可能因上游 Wine 或 Microsoft 更新而失效；因使用本项目产生的数据丢失、许可问题或其他损失由用户自行承担。
