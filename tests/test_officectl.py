@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -223,6 +224,7 @@ class OfficeTests(unittest.TestCase):
         self.assertEqual(progress.poll(), [
             ("start", "STREAM", None),
             ("progress", "STREAM", 1),
+            ("progress", "STREAM", 7),
             ("progress", "STREAM", 15),
             ("progress", "STREAM", 35),
             ("progress", "STREAM", 67),
@@ -243,7 +245,69 @@ class OfficeTests(unittest.TestCase):
         self.assertEqual(progress.poll(), [])
         with log.open("ab") as stream:
             stream.write("\n".encode("utf-16le"))
-        self.assertEqual(progress.poll(), [("progress", "STREAM", 72)])
+        self.assertEqual(progress.poll(), [])
+
+    def test_c2r_small_increases_and_partial_records_are_not_hidden(self):
+        log = self.office.prefix / "drive_c/windows/NIXOS-progress.log"
+        log.parent.mkdir(parents=True)
+        progress = officectl.InstallProgress(self.office)
+        task_id = "4CCD26FB-A773-42FB-8E44-CD53798BC0E7"
+        log.write_bytes((
+            f'Task::Execute {{"TaskType":"STREAM:{{{task_id}}}","Scenario":"INSTALL"}}\n'
+            f'ScenarioController::UpdateScenarioProgress - {{{task_id}}}=1\n'
+            f'ScenarioController::UpdateScenarioProgress - {{{task_id}}}=1\n'
+            f'ScenarioController::UpdateScenarioProgress - {{{task_id}}}=6\n'
+            f'ScenarioController::UpdateScenarioProgress - {{{task_id}}}=5\n'
+            f'ScenarioController::UpdateScenarioProgress - {{{task_id}}}=9'
+        ).encode("utf-16le"))
+        self.assertEqual(progress.poll(), [
+            ("start", "STREAM", None), ("progress", "STREAM", 1), ("progress", "STREAM", 6),
+        ])
+        with log.open("ab") as stream:
+            stream.write("\n".encode("utf-16le"))
+        self.assertEqual(progress.poll(), [("progress", "STREAM", 9)])
+
+    def test_c2r_download_telemetry_is_deduplicated_and_scoped_to_stream(self):
+        log = self.office.prefix / "drive_c/windows/NIXOS-download.log"
+        log.parent.mkdir(parents=True)
+        progress = officectl.InstallProgress(self.office)
+        task_id = "4CCD26FB-A773-42FB-8E44-CD53798BC0E7"
+        start = 'C2R::Transport::BGTransportJob::StartDownload::<lambda_1>::operator () ' + json.dumps({
+            "ContextData": json.dumps({"message": "Time to start job", "FileName": "stream.x64.en-us.dat"}),
+        }) + "\n"
+        complete = "ActivityEnded " + json.dumps({
+            "Name": "Office.ClickToRun.Transport2", "CV": "transfer.1", "Success": True,
+            "Data.SourcePathNoFilePath": "http://officecdn.microsoft.com/Office/Data/stream.x64.en-us.dat",
+            "Data.TransferredBytes": "1048576",
+        }) + "\n"
+        log.write_text(start + complete)
+        self.assertEqual(progress.poll(), [])
+        with log.open("a") as stream:
+            stream.write(
+                f'Task::Execute {{"TaskType":"STREAM:{{{task_id}}}","Scenario":"INSTALL"}}\n'
+                + start + start + complete + complete
+                + 'ActivityEnded {"Name":"Office.ClickToRun.Transport2","Success":true,"Data.TransferredBytes":[]}\n'
+                + f'Task::DoHandleWorkerSuccessEvent {{"TaskType":"STREAM:{{{task_id}}}"}}\n'
+                + start + complete
+            )
+        self.assertEqual(progress.poll(), [
+            ("start", "STREAM", None), ("download", "stream.x64.en-us.dat", None),
+            ("transfer", "stream.x64.en-us.dat", 1048576), ("complete", "STREAM", None),
+        ])
+
+    def test_c2r_reports_waiting_status_when_percentage_does_not_change(self):
+        progress = officectl.InstallProgress(self.office)
+        task_id = "4CCD26FB-A773-42FB-8E44-CD53798BC0E7"
+        progress.task_types[task_id] = "STREAM"
+        progress.started.add(task_id)
+        progress.last_task_percent[task_id] = 1
+        stop = Mock()
+        stop.is_set.side_effect = [False, False, False, True]
+        with patch.object(progress, "poll", return_value=[]), patch.object(progress, "report") as report, \
+                patch.object(officectl.time, "monotonic", side_effect=[0, 19, 20, 21]):
+            progress.run(stop)
+        report.assert_any_call([("status", "STREAM", 1)])
+        self.assertEqual(sum(bool(call.args[0]) for call in report.call_args_list), 1)
 
     def test_c2r_task_and_progress_events_are_merged_by_log_timestamp(self):
         logs = self.office.prefix / "drive_c/users/test/AppData/Local/Temp"

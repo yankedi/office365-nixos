@@ -88,6 +88,8 @@ class InstallProgress:
         self.started = set()
         self.finished = set()
         self.last_task_percent = {}
+        self.downloads = set()
+        self.transfers = set()
         # Existing logs belong to prior attempts; only report data appended
         # after this installation starts, plus newly-created log files.
         for path in office.c2r_log_paths():
@@ -165,11 +167,18 @@ class InstallProgress:
                 task = self.task_types.get(task_id)
                 if (task in C2R_TASK_LABELS
                         and self.task_scenarios.get(task_id, "INSTALL") == "INSTALL"
+                        and task_id not in self.finished
                         and 0 <= percent < 100):
                     previous = self.last_task_percent.get(task_id)
-                    self.last_task_percent[task_id] = percent
-                    if previous is None or percent // 10 > previous // 10:
+                    if previous is None or percent > previous:
+                        self.last_task_percent[task_id] = percent
                         events.append(("progress", task, percent))
+
+            # These records carry real filenames and completed-transfer byte
+            # counts, not a live network percentage. Restrict them to an active
+            # installation STREAM task and avoid repeated failover telemetry.
+            if any(self.task_types[task_id] == "STREAM" for task_id in self.started - self.finished):
+                events.extend(self.download_events(line))
 
             event_type = None
             if "Task::DoHandleWorkerSuccessEvent " in line:
@@ -194,9 +203,62 @@ class InstallProgress:
                     events.append((event_type, task, None))
         return events
 
+    def download_events(self, line):
+        start = "C2R::Transport::BGTransportJob::StartDownload" in line
+        complete = "ActivityEnded " in line and '"Office.ClickToRun.Transport2"' in line
+        if not (start or complete):
+            return []
+        try:
+            data = json.loads(line[line.index("{"):].strip())
+            if not isinstance(data, dict):
+                return []
+            if start:
+                context = json.loads(data.get("ContextData", "{}"))
+                if not isinstance(context, dict):
+                    return []
+                filename = context.get("FileName", "")
+            else:
+                if data.get("Success") is not True:
+                    return []
+                source = data.get("Data.SourcePathNoFilePath", "")
+                filename = urlsplit(source).path.rsplit("/", 1)[-1] if isinstance(source, str) else ""
+            if not isinstance(filename, str) or not re.fullmatch(r"[\w.-]{1,128}", filename):
+                return []
+            if start:
+                if filename in self.downloads:
+                    return []
+                self.downloads.add(filename)
+                return [("download", filename, None)]
+            transfer_id = data.get("CV")
+            size = int(data.get("Data.TransferredBytes", 0))
+            if not isinstance(transfer_id, str) or not transfer_id or transfer_id in self.transfers or size <= 0:
+                return []
+            self.transfers.add(transfer_id)
+            return [("transfer", filename, size)]
+        except (ValueError, TypeError):
+            return []
+
+    def status(self):
+        return [("status", task, self.last_task_percent.get(task_id))
+                for task_id, task in self.task_types.items()
+                if task_id in self.started and task_id not in self.finished] or [("status", "", None)]
+
     @staticmethod
     def report(events):
         for event, task, percent in events:
+            if event == "download":
+                print(f"  获取安装数据：{task}…", flush=True)
+                continue
+            if event == "transfer":
+                print(f"  数据传输完成：{task}（本次传输 {percent / (1024 * 1024):.1f} MiB）。", flush=True)
+                continue
+            if event == "status":
+                if task:
+                    latest = f"（最近报告 {percent}%）" if percent is not None else ""
+                    print(f"  等待安装器报告新进度：{C2R_TASK_LABELS[task]}{latest}…", flush=True)
+                else:
+                    print("  安装器仍在运行，等待下一条安装任务记录…", flush=True)
+                continue
             label = C2R_TASK_LABELS[task]
             if event == "start":
                 print(f"Office 安装阶段：{label}…", flush=True)
@@ -208,8 +270,16 @@ class InstallProgress:
                 print(f"Office 阶段异常：{label}；详见 NIXOS 安装日志。", flush=True)
 
     def run(self, stop, interval=1.0):
+        last_output = time.monotonic()
         while not stop.is_set():
-            self.report(self.poll())
+            events = self.poll()
+            now = time.monotonic()
+            if events:
+                self.report(events)
+                last_output = now
+            elif now - last_output >= 20:
+                self.report(self.status())
+                last_output = now
             stop.wait(interval)
         self.report(self.poll())
 
