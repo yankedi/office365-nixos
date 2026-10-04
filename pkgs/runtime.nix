@@ -45,45 +45,56 @@ let
     gst_all_1.gstreamer
     gst_all_1.gst-plugins-base
   ];
+  upstream = stdenv.mkDerivation {
+    pname = "wine4office-runtime";
+    version = "0.2.2-beta.2";
+    src = fetchurl {
+      url = "https://github.com/ttv20/wine4office/releases/download/0.2.2-beta.2/wine4office-0.2.2-beta.2-x86_64.tar.zst";
+      sha256 = "16d90f45ca0ecf6ab0b28c78f3e893a915aa829ecc050038a71783acc19f2360";
+    };
+    nativeBuildInputs = [
+      autoPatchelfHook
+      zstd
+    ];
+    buildInputs = runtimeLibraries;
+    runtimeDependencies = map lib.getLib runtimeLibraries;
+    # Wine loads optional libraries from its Unix DLLs with dlopen. RUNPATH on
+    # bin/wine is not inherited by those DLLs; give every ELF the complete paths.
+    appendRunpaths = map (pkg: "${lib.getLib pkg}/lib") runtimeLibraries ++ [
+      "/run/opengl-driver/lib"
+    ];
+    dontBuild = true;
+    dontStrip = true;
+    installPhase = ''
+      runHook preInstall
+      mkdir -p "$out"
+      cp -a ./. "$out/"
+      runHook postInstall
+    '';
+    preFixup = ''
+      addAutoPatchelfSearchPath "$out/lib/wine/x86_64-unix"
+      # Debian's libpcap.so.0.8 and nixpkgs' libpcap.so.1 expose the same ABI.
+      patchelf --replace-needed libpcap.so.0.8 libpcap.so.1 \
+        "$out/lib/wine/x86_64-unix/wpcap.so"
+    '';
+    passthru = { inherit runtimeLibraries; };
+    meta = {
+      description = "Pinned upstream Wine4Office binary runner with NixOS runtime dependencies";
+      homepage = "https://github.com/ttv20/wine4office";
+      license = lib.licenses.lgpl21Plus;
+      sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
+      platforms = [ "x86_64-linux" ];
+    };
+  };
+  qmgr = pkgs.callPackage ./qmgr.nix { runner = upstream; };
 in
-stdenv.mkDerivation {
-  pname = "wine4office-runtime";
-  version = "0.2.2-beta.2";
-  src = fetchurl {
-    url = "https://github.com/ttv20/wine4office/releases/download/0.2.2-beta.2/wine4office-0.2.2-beta.2-x86_64.tar.zst";
-    sha256 = "16d90f45ca0ecf6ab0b28c78f3e893a915aa829ecc050038a71783acc19f2360";
-  };
-  nativeBuildInputs = [
-    autoPatchelfHook
-    zstd
-  ];
-  buildInputs = runtimeLibraries;
-  runtimeDependencies = map lib.getLib runtimeLibraries;
-  # Wine loads optional libraries from its Unix DLLs with dlopen. RUNPATH on
-  # bin/wine is not inherited by those DLLs; give every ELF the complete paths.
-  appendRunpaths = map (pkg: "${lib.getLib pkg}/lib") runtimeLibraries ++ [
-    "/run/opengl-driver/lib"
-  ];
-  dontBuild = true;
-  dontStrip = true;
-  installPhase = ''
-    runHook preInstall
-    mkdir -p "$out"
-    cp -a ./. "$out/"
-    runHook postInstall
+upstream.overrideAttrs (old: {
+  postInstall = (old.postInstall or "") + ''
+    for arch in x86_64-windows i386-windows; do
+      install -m644 ${qmgr}/lib/wine/$arch/qmgr.dll "$out/lib/wine/$arch/qmgr.dll"
+    done
   '';
-  preFixup = ''
-    addAutoPatchelfSearchPath "$out/lib/wine/x86_64-unix"
-    # Debian's libpcap.so.0.8 and nixpkgs' libpcap.so.1 expose the same ABI.
-    patchelf --replace-needed libpcap.so.0.8 libpcap.so.1 \
-      "$out/lib/wine/x86_64-unix/wpcap.so"
-  '';
-  passthru = { inherit runtimeLibraries; };
-  meta = {
-    description = "Pinned upstream Wine4Office binary runner with NixOS runtime dependencies";
-    homepage = "https://github.com/ttv20/wine4office";
-    license = lib.licenses.lgpl21Plus;
-    sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
-    platforms = [ "x86_64-linux" ];
+  passthru = old.passthru // {
+    inherit qmgr;
   };
-}
+})

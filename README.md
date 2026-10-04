@@ -5,6 +5,7 @@
 - 支持平台：`x86_64-linux`
 - 图形后端：X11 / XWayland
 - Office 运行时：Wine4Office `0.2.2-beta.2`
+- 下载服务修补：从同版本源码重建 `qmgr.dll`，修复分段下载失败时异步读取缓冲区提前释放导致的服务崩溃；详见[下载故障调查与验证](docs/DOWNLOADS.md)。
 - NixOS 模块：`programs.office365`
 
 ## 已知问题

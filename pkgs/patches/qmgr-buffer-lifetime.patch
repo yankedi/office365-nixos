@@ -1,0 +1,92 @@
+--- a/dlls/qmgr/file.c
++++ b/dlls/qmgr/file.c
+@@ -759,6 +759,7 @@
+     HANDLE event;
+     HRESULT error;
+     DWORD read_size;
++    char *buffer;
+ };
+ 
+ static BOOL parallel_transfer_stopped(struct parallel_range_context *context)
+@@ -820,6 +821,7 @@
+         SetEvent(operation->event);
+         break;
+     case WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING:
++        free(operation->buffer);
+         CloseHandle(operation->event);
+         free(operation);
+         break;
+@@ -853,7 +855,7 @@
+ }
+ 
+ static BOOL transfer_http_range_async(struct parallel_range_context *context, HINTERNET connection,
+-                                      DWORD range_index, char *buffer)
++                                      DWORD range_index)
+ {
+     BackgroundCopyFileImpl *file = context->file;
+     BackgroundCopyJobImpl *job = file->owner;
+@@ -868,6 +870,7 @@
+     BOOL callback_owns_operation = FALSE, ret = FALSE;
+ 
+     if (!(operation = calloc(1, sizeof(*operation))) ||
++        !(operation->buffer = malloc(HTTP_READ_BUFFER_SIZE)) ||
+         !(operation->event = CreateEventW(NULL, FALSE, FALSE, NULL)))
+     {
+         hr = E_OUTOFMEMORY;
+@@ -954,7 +957,7 @@
+     while (received < expected)
+     {
+         prepare_parallel_http(operation);
+-        if (!WinHttpReadData(request, buffer, HTTP_READ_BUFFER_SIZE, NULL) ||
++        if (!WinHttpReadData(request, operation->buffer, HTTP_READ_BUFFER_SIZE, NULL) ||
+             !wait_for_parallel_http(operation))
+         {
+             hr = operation->error;
+@@ -966,7 +969,7 @@
+             hr = BG_E_INSUFFICIENT_RANGE_SUPPORT;
+             goto done;
+         }
+-        if (!write_range_data(context, range_index, received, buffer, read))
++        if (!write_range_data(context, range_index, received, operation->buffer, read))
+         {
+             hr = HRESULT_FROM_WIN32(GetLastError());
+             goto done;
+@@ -987,6 +990,7 @@
+     if (request) WinHttpCloseHandle(request);
+     if (!callback_owns_operation && operation)
+     {
++        free(operation->buffer);
+         if (operation->event) CloseHandle(operation->event);
+         free(operation);
+     }
+@@ -998,14 +1002,8 @@
+     struct parallel_range_context *context = param;
+     BackgroundCopyFileImpl *file = context->file;
+     HINTERNET session = NULL, connection = NULL;
+-    char *buffer = NULL;
+     LONG index;
+ 
+-    if (!(buffer = malloc(HTTP_READ_BUFFER_SIZE)))
+-    {
+-        set_parallel_range_error(context, E_OUTOFMEMORY, BG_ERROR_CONTEXT_GENERAL_TRANSPORT);
+-        goto done;
+-    }
+     if (!(session = WinHttpOpen(NULL, 0, NULL, NULL, WINHTTP_FLAG_ASYNC)) ||
+         WinHttpSetStatusCallback(session, parallel_http_callback,
+                                  WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS |
+@@ -1023,14 +1021,13 @@
+     {
+         index = InterlockedIncrement(&context->next_range) - 1;
+         if ((DWORD)index >= file->range_count) break;
+-        if (!transfer_http_range_async(context, connection, index, buffer)) break;
++        if (!transfer_http_range_async(context, connection, index)) break;
+         InterlockedIncrement(&context->completed_ranges);
+     }
+ 
+  done:
+     if (connection) WinHttpCloseHandle(connection);
+     if (session) WinHttpCloseHandle(session);
+-    free(buffer);
+     return 0;
+ }
+ 
