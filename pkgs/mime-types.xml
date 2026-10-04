@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/vnd.ms-access">
+    <comment>Microsoft Access database</comment>
+    <glob pattern="*.accdb"/>
+    <glob pattern="*.accde"/>
+    <glob pattern="*.accdr"/>
+    <glob pattern="*.accdt"/>
+    <glob pattern="*.accda"/>
+    <glob pattern="*.mde"/>
+  </mime-type>
+  <mime-type type="application/vnd.ms-outlook">
+    <comment>Microsoft Outlook item</comment>
+    <glob pattern="*.msg"/>
+    <glob pattern="*.oft"/>
+  </mime-type>
+  <mime-type type="application/onenote">
+    <comment>Microsoft OneNote notebook</comment>
+    <glob pattern="*.one"/>
+    <glob pattern="*.onepkg"/>
+    <glob pattern="*.onetoc2"/>
+  </mime-type>
+</mime-info>
