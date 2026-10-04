@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -206,21 +207,69 @@ class OfficeTests(unittest.TestCase):
             "ScenarioController::UpdateScenarioProgress - total progress is now 12.\n".encode("utf-16le")
         )
         progress = officectl.InstallProgress(self.office)
+        task_id = "4CCD26FB-A773-42FB-8E44-CD53798BC0E7"
         with log.open("ab") as stream:
             stream.write(
-                "ScenarioController::UpdateScenarioProgress - total progress is now 35.\n"
-                "ScenarioController::UpdateScenarioProgress - total progress is now 67.\n".encode("utf-16le")
+                f'Task::Execute {{"TaskType":"STREAM:{{{task_id}}}","Scenario":"INSTALL"}}\n'
+                f"ScenarioController::UpdateScenarioProgress - {{{task_id}}}=1\n"
+                f"ScenarioController::UpdateScenarioProgress - {{{task_id}}}=7\n"
+                f"ScenarioController::UpdateScenarioProgress - {{{task_id}}}=15\n"
+                f"ScenarioController::UpdateScenarioProgress - {{{task_id}}}=35\n"
+                f"ScenarioController::UpdateScenarioProgress - {{{task_id}}}=67\n"
+                f"ScenarioController::UpdateScenarioProgress - {{{task_id}}}=100\n"
+                f'Task::DoHandleWorkerSuccessEvent {{"TaskType":"STREAM:{{{task_id}}}"}}\n'
+                .encode("utf-16le")
             )
-        self.assertEqual(progress.poll(), [35, 67])
+        self.assertEqual(progress.poll(), [
+            ("start", "STREAM", None),
+            ("progress", "STREAM", 1),
+            ("progress", "STREAM", 15),
+            ("progress", "STREAM", 35),
+            ("progress", "STREAM", 67),
+            ("complete", "STREAM", None),
+        ])
+        self.assertEqual(progress.poll(), [])
+        interaction_id = "8F40ABF1-88C8-49F2-9B8C-FAF494FB3F43"
+        with log.open("ab") as stream:
+            stream.write(
+                f'Task::Execute {{"TaskType":"ONLINEINTERACTION:{{{interaction_id}}}",'
+                '"Scenario":"RICHINTERACTION"}\n'
+                f'Task::DoHandleWorkerSuccessEvent {{"TaskType":"ONLINEINTERACTION:{{{interaction_id}}}",'
+                '"Scenario":"RICHINTERACTION"}\n'.encode("utf-16le")
+            )
         self.assertEqual(progress.poll(), [])
         with log.open("ab") as stream:
-            stream.write(
-                "ScenarioController::UpdateScenarioProgress - total progress is now 92.".encode("utf-16le")
-            )
+            stream.write(f"ScenarioController::UpdateScenarioProgress - {{{task_id}}}=72.".encode("utf-16le"))
         self.assertEqual(progress.poll(), [])
         with log.open("ab") as stream:
             stream.write("\n".encode("utf-16le"))
-        self.assertEqual(progress.poll(), [92])
+        self.assertEqual(progress.poll(), [("progress", "STREAM", 72)])
+
+    def test_c2r_task_and_progress_events_are_merged_by_log_timestamp(self):
+        logs = self.office.prefix / "drive_c/users/test/AppData/Local/Temp"
+        logs.mkdir(parents=True)
+        task_log = logs / "NIXOS-20261004-task.log"
+        progress_log = logs / "NIXOS-20261004-progress.log"
+        task_log.touch()
+        progress_log.touch()
+        progress = officectl.InstallProgress(self.office)
+        task_id = "4CCD26FB-A773-42FB-8E44-CD53798BC0E7"
+        progress_line = (
+            f'10/04/2026 17:00:02.000\tOFFICECL\t0x100\tClick-To-Run\t'
+            f'ScenarioController::UpdateScenarioProgress - {{{task_id}}}=20\n'
+        )
+        task_line = (
+            f'10/04/2026 17:00:01.000\tOFFICECL\t0x100\tClick-To-Run\tTask::Execute '
+            f'{{"TaskType":"STREAM:{{{task_id}}}","Scenario":"INSTALL"}}\n'
+        )
+        progress_log.write_bytes(progress_line.encode("utf-16le"))
+        task_log.write_bytes(task_line.encode("utf-16le"))
+        os.utime(task_log, (2, 2))
+        os.utime(progress_log, (1, 1))
+        self.assertEqual(progress.poll(), [
+            ("start", "STREAM", None),
+            ("progress", "STREAM", 20),
+        ])
 
     def simulate_install(self, fail=False):
         events = []

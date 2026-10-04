@@ -48,10 +48,26 @@ CONFIGURATION = """<?xml version="1.0" encoding="utf-8"?>
   <Display Level="Full" />
 </Configuration>
 """
-C2R_TOTAL_PROGRESS = re.compile(
-    r"ScenarioController::UpdateScenarioProgress\s*-\s*total progress is now\s+(\d+)",
+C2R_TASK_TYPE = re.compile(r'"TaskType"\s*:\s*"([A-Za-z_]+):\{([0-9A-Fa-f-]{36})\}"')
+C2R_TASK_SCENARIO = re.compile(r'"Scenario"\s*:\s*"([^"]+)"')
+C2R_TASK_PROGRESS = re.compile(
+    r"ScenarioController::UpdateScenarioProgress\s*-\s*\{([0-9A-Fa-f-]{36})\}=(\d+)",
     re.IGNORECASE,
 )
+C2R_TASK_LABELS = {
+    "PROMPTUSER": "等待安装器准备",
+    "CREATEWORKINGCONFIGURATION": "生成 Office 安装计划",
+    "STREAM": "下载并展开 O365BusinessRetail（zh-cn + en-us）数据",
+    "STAGEREGISTRY": "暂存 Office 注册表配置",
+    "APPLYCONFIGURATION": "应用 Office 程序和 zh-cn/en-us 语言组件",
+    "INITUPDATES": "初始化 Click-to-Run 更新组件",
+    "INTEGRATE_INSTALL": "集成并注册 Office 应用",
+    "UNINSTALLCENTENNIAL": "检查旧版 Store Office",
+    "MIGRATE": "迁移 Office 配置",
+    "FONTS": "部署 Office 自带的字体组件",
+    "LASTRUN": "完成安装收尾",
+    "ONLINEINTERACTION": "完成 Click-to-Run 在线交互初始化",
+}
 
 
 class OfficeError(Exception):
@@ -61,13 +77,17 @@ class OfficeError(Exception):
 
 
 class InstallProgress:
-    """Read Click-to-Run's native ULS logs and report scenario percentages."""
+    """Read Click-to-Run task names and per-task progress from native ULS logs."""
 
     def __init__(self, office):
         self.office = office
         self.offsets = {}
         self.pending = {}
-        self.last_percent = None
+        self.task_types = {}
+        self.task_scenarios = {}
+        self.started = set()
+        self.finished = set()
+        self.last_task_percent = {}
         # Existing logs belong to prior attempts; only report data appended
         # after this installation starts, plus newly-created log files.
         for path in office.c2r_log_paths():
@@ -92,7 +112,8 @@ class InstallProgress:
         return data.decode("utf-8", errors="replace"), len(data)
 
     def poll(self):
-        percentages = []
+        events = []
+        log_lines = []
         for path in self.office.c2r_log_paths():
             try:
                 size = path.stat().st_size
@@ -113,23 +134,84 @@ class InstallProgress:
             lines = (self.pending.pop(path, "") + text).splitlines(keepends=True)
             if lines and not lines[-1].endswith(("\n", "\r")):
                 self.pending[path] = lines.pop()
-            for line in lines:
-                match = C2R_TOTAL_PROGRESS.search(line)
-                if not match:
-                    continue
-                percent = int(match.group(1))
-                if 0 <= percent <= 100 and percent != self.last_percent:
-                    self.last_percent = percent
-                    percentages.append(percent)
-        return percentages
+            log_lines.extend(lines)
+
+        def timestamp(line):
+            try:
+                return datetime.strptime(line[:23], "%m/%d/%Y %H:%M:%S.%f").timestamp()
+            except ValueError:
+                return 0
+
+        # Click-to-Run writes concurrently to several ULS files; process their
+        # newly appended records in timestamp order so task IDs are known before
+        # their per-task progress records arrive.
+        for line in sorted(log_lines, key=timestamp):
+            if "Task::Execute " in line:
+                match = C2R_TASK_TYPE.search(line)
+                if match:
+                    task, task_id = match.group(1).upper(), match.group(2).upper()
+                    self.task_types[task_id] = task
+                    scenario = C2R_TASK_SCENARIO.search(line)
+                    self.task_scenarios[task_id] = scenario.group(1).upper() if scenario else "INSTALL"
+                    if self.task_scenarios[task_id] != "INSTALL":
+                        continue
+                    if task in C2R_TASK_LABELS and task_id not in self.started:
+                        self.started.add(task_id)
+                        events.append(("start", task, None))
+
+            progress = C2R_TASK_PROGRESS.search(line)
+            if progress:
+                task_id, percent = progress.group(1).upper(), int(progress.group(2))
+                task = self.task_types.get(task_id)
+                if (task in C2R_TASK_LABELS
+                        and self.task_scenarios.get(task_id, "INSTALL") == "INSTALL"
+                        and 0 <= percent < 100):
+                    previous = self.last_task_percent.get(task_id)
+                    self.last_task_percent[task_id] = percent
+                    if previous is None or percent // 10 > previous // 10:
+                        events.append(("progress", task, percent))
+
+            event_type = None
+            if "Task::DoHandleWorkerSuccessEvent " in line:
+                event_type = "complete"
+            elif "Task::DoHandleWorkerExceptionEvent " in line:
+                event_type = "error"
+            if event_type:
+                match = C2R_TASK_TYPE.search(line)
+                if match:
+                    task, task_id = match.group(1).upper(), match.group(2).upper()
+                    self.task_types[task_id] = task
+                    scenario = C2R_TASK_SCENARIO.search(line)
+                    if scenario:
+                        self.task_scenarios[task_id] = scenario.group(1).upper()
+                    if self.task_scenarios.get(task_id, "INSTALL") != "INSTALL":
+                        continue
+                    if task not in C2R_TASK_LABELS or task_id in self.finished:
+                        continue
+                    self.finished.add(task_id)
+                    if task_id not in self.started:
+                        events.append(("start", task, None))
+                    events.append((event_type, task, None))
+        return events
+
+    @staticmethod
+    def report(events):
+        for event, task, percent in events:
+            label = C2R_TASK_LABELS[task]
+            if event == "start":
+                print(f"Office 安装阶段：{label}…", flush=True)
+            elif event == "progress":
+                print(f"  当前阶段进度：{label} {percent}%", flush=True)
+            elif event == "complete":
+                print(f"Office 阶段结束：{label}。", flush=True)
+            elif event == "error":
+                print(f"Office 阶段异常：{label}；详见 NIXOS 安装日志。", flush=True)
 
     def run(self, stop, interval=1.0):
         while not stop.is_set():
-            for percent in self.poll():
-                print(f"Office Click-to-Run 总进度：{percent}%", flush=True)
+            self.report(self.poll())
             stop.wait(interval)
-        for percent in self.poll():
-            print(f"Office Click-to-Run 总进度：{percent}%", flush=True)
+        self.report(self.poll())
 
 
 def windows_path(value):
@@ -365,7 +447,7 @@ class Office:
                     progress_thread = threading.Thread(
                         target=progress.run, args=(progress_stop,), daemon=True
                     )
-                    print("读取 Click-to-Run 安装进度…", flush=True)
+                    print("跟踪 Click-to-Run 安装任务…", flush=True)
                     progress_thread.start()
                     try:
                         self.run_wine([self.resources["odt"], "/configure", windows_path(str(xml))],

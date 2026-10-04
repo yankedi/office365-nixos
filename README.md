@@ -1,46 +1,114 @@
 # office365-nixos
 
-NixOS 上的 Microsoft 365：声明式准备运行资源，由用户显式安装 Office 和中文字体。
+在 NixOS 上声明式部署 Microsoft 365 的 Wine 运行资源，并由用户显式管理 Office prefix 和中文字体。
 
-支持 `x86_64-linux`、X11 / XWayland。固定使用 Wine4Office `0.2.2-beta.2` 上游预编译 runner。
+- 支持平台：`x86_64-linux`
+- 图形后端：X11 / XWayland
+- Office 运行时：Wine4Office `0.2.2-beta.2`
+- NixOS 模块：`programs.office365`
+
+## 已知问题
+
+1. **原生 Wayland 渲染路径无法正常使用**：会导致光标停留在窗口缩放（resize）状态。当前启动器使用 X11 / XWayland 路径。
+2. **OneNote 无法正常打开**：启动时查询 WMI 类 `Win32_ServerFeature`，当前 runner 未实现该类，导致弹出“必须先安装桌面体验（Desktop Experience）”并阻止进入主界面。对应 [Wine bug #47135](https://bugs.winehq.org/show_bug.cgi?id=47135)，详见[隔离复现记录](docs/ONENOTE.md)。保留 `onenote365` 命令和桌面入口，但当前不可用。
+3. **Word 多页文档滚动性能异常**：多页面下滚动可能明显卡顿。上游 [PR #57：稀疏 Present1 更新](https://github.com/ttv20/wine4office/pull/57) 记录了相关渲染瓶颈：原路径在每次 `Present1` 时复制整个表面，而非仅处理变更及滚动区域，增加局部重绘开销。上游已为符合条件的 WineD3D Vulkan 交换链实现稀疏更新，但 OpenGL 等路径仍保留全量复制。本项目当前使用 WineD3D OpenGL（`renderer=gl`），不在该优化的适用范围内；目前没有在本项目中验证通过的滚动修复方案。
+
+4. **Word 关闭时可能无法正常退出**：在当前 X11 / XWayland 路径下，关闭含有未保存修改的文档时，弹出的保存确认对话框可能难以定位或操作，导致 Word 一直等待确认、无法正常结束。遇到这种情况可手动 `kill` 对应的 `WINWORD.EXE` 进程；未保存的修改可能丢失。
 
 ## 接入 NixOS
 
-在系统 flake 中添加输入（新 GitHub 仓库发布后使用）：
+本项目提供标准 NixOS module 输出 `nixosModules.default`。按 NixOS 的 Flake 配置方式，在系统 flake 中添加输入，并将模块放入 `nixosSystem.modules`。
+
+### 1. 添加 flake input
+
+保留现有 `nixpkgs` 输入及其分支，在系统 `flake.nix` 的 `inputs` 中添加：
 
 ```nix
-inputs.office365-nixos = {
+office365-nixos = {
   url = "github:yankedi/office365-nixos";
   inputs.nixpkgs.follows = "nixpkgs";
 };
 ```
 
-本地开发时，`url` 可写为 `"path:/home/yan/lib/office365-nixos"`。
-
-在 NixOS 的 `modules` 中导入模块并启用：
+然后在现有 `outputs` 中，将项目模块加入对应主机的 `nixosSystem.modules`，保留原有模块。例如：
 
 ```nix
-{ inputs, lib, ... }:
-{
-  imports = [ inputs.office365-nixos.nixosModules.default ];
+outputs = inputs@{ nixpkgs, ... }: {
+  nixosConfigurations."my-host" = nixpkgs.lib.nixosSystem {
+    system = "x86_64-linux";
+    modules = [
+      inputs.office365-nixos.nixosModules.default
+      ./configuration.nix
+      # 保留其他已有模块
+    ];
+  };
+};
+```
 
+将 `my-host` 替换为你在 `nixosConfigurations` 中使用的名称。`nixpkgs.follows` 让 Office flake 与系统共享同一份 nixpkgs 依赖；`flake.lock` 会固定实际使用的提交。
+
+### 2. 启用模块
+
+在 `configuration.nix` 中配置：
+
+```nix
+{ lib, ... }:
+{
   programs.office365.enable = true;
 
-  # ODT 是微软的非自由安装工具；合并到你已有的允许列表中。
+  # ODT 是非自由软件，只允许此安装工具。
   nixpkgs.config.allowUnfreePredicate = pkg:
-    builtins.elem (lib.getName pkg) [ "office-deployment-tool" ];
+    lib.getName pkg == "office-deployment-tool";
 }
 ```
 
-上面的配置片段通过 `specialArgs = { inherit inputs; };` 传入输入。
-也可以直接把 `inputs.office365-nixos.nixosModules.default` 放入 `nixosSystem.modules`。
-模块通过系统的 `pkgs` 构建运行资源；保留 `nixpkgs.follows`，使 flake 命令与系统显卡驱动使用一致的运行库版本。
-项目默认锁定 `nixos-unstable`；直接 `nix run` 时也应与宿主图形栈保持兼容。
+如果已有 `nixpkgs.config.allowUnfreePredicate`，请把 `office-deployment-tool` 条件并入现有函数，保留其他已允许的包。若现有逻辑是按包名白名单，可将包名加进同一列表；若现有函数包含其他判断，用 `||` 组合条件。不要为了 ODT 全局开启 `allowUnfree = true`。
 
-`nixos-rebuild switch` 准备 runner、运行库、ODT、中文 locale、阴影助手、命令、图标和桌面入口。
-**构建和 activation 均不运行 Wine、创建用户 prefix 或安装 Office；也不下载字体 ISO / 构建中文字体包。**
+**重要：**必须在同一次 NixOS module evaluation 中导入 `nixosModules.default`，否则 `programs.office365` 选项未声明，会报 `The option programs.office365 does not exist`。
 
-应用入口在 switch 后立即显示。未安装时，启动器会提示执行 `officectl init`。
+### 使用 flake-parts 的配置
+
+若通过 `flake.modules.nixos.<name>` 定义本地系统模块，要在这个 NixOS module 自身的 `imports` 中导入项目模块。外层 flake-parts 参数中的 `inputs` 可由闭包引用：
+
+```nix
+{ inputs, ... }:
+{
+  flake.modules.nixos.office365 = { lib, ... }: {
+    imports = [ inputs.office365-nixos.nixosModules.default ];
+
+    programs.office365.enable = true;
+    nixpkgs.config.allowUnfreePredicate = pkg:
+      lib.getName pkg == "office-deployment-tool";
+  };
+}
+```
+
+这和 NixOS 手册的模块规则一致：`imports` 负责将声明选项的模块加入当前 module set；只写 `programs.office365.enable = true` 不会自动引入选项定义。
+基本示例中的 `configuration.nix` 不直接引用 flake `inputs`，所以不需 `specialArgs`；只有 NixOS module 本身要访问 `inputs` 时，才通过 `nixosSystem.specialArgs` 显式传入。
+
+### 构建和切换
+
+```bash
+# 构建系统闭包，不创建当前目录下的 result 链接
+nix build .#nixosConfigurations.my-host.config.system.build.toplevel --no-link
+
+# 应用系统配置
+sudo nixos-rebuild switch --flake .#my-host
+```
+
+若要更新到此项目的新提交，在系统 flake 目录运行 `nix flake update office365-nixos`，审阅并保留更新后的 `flake.lock`，再构建/切换。若 flake 使用其他 NixOS 配置名称，请相应替换 `my-host`。
+
+`nixos-rebuild switch` 只准备 runner、运行库、ODT、locale、阴影助手、命令、图标和桌面入口。**构建与切换不会运行 Wine、创建用户 prefix、安装 Office、下载字体 ISO 或构建中文字体包。**桌面入口会立即出现；Office 尚未安装时，启动器会提示运行 `officectl init`。
+
+模块选项：
+
+| 选项 | 默认值 | 说明 |
+|---|---:|---|
+| `programs.office365.enable` | `false` | 启用资源包和桌面入口 |
+| `programs.office365.defaultApplications` | `true` | 将 Office 专用文档 MIME 类型设为系统默认应用 |
+| `programs.office365.package` | 项目包 | 允许覆盖默认运行资源包 |
+
+参考：[NixOS Manual: 写 NixOS Modules](https://nixos.org/manual/nixos/stable/#sec-writing-modules)、[NixOS Manual](https://nixos.org/manual/nixos/stable/)、[nix.dev: Flakes](https://nix.dev/concepts/flakes)、[nix.dev: Module system deep dive](https://nix.dev/tutorials/module-system/deep-dive)、[Nixpkgs Reference Manual: Unfree packages](https://nixos.org/manual/nixpkgs/stable/)、[flake-parts: modules](https://flake.parts/options/flake-parts-modules)。
 
 ## 安装 Office
 
@@ -62,7 +130,16 @@ Office 主体由 ODT 在此时联网下载。初始化需要正常的 X11 / XWay
 初始化严格限于安装所需步骤：`wineboot` → 重置并等待 wineserver → broker 保活 / 服务看护 →
 ODT 安装 → 检查退出码、`WINWORD.EXE`、`1033`、`2052` → 清理本次 prefix 的安装进程。
 不安装字体、不启动 Word、不执行登录激活。
-ODT 启动后，`officectl` 会监视 prefix 中的 `NIXOS-*.log`，将 Click-to-Run 报告的安装任务总进度百分比（不是单独的网络字节百分比）实时写到终端；详细原始日志仍保存在 prefix 的 `drive_c/windows/` 和 `drive_c/users/*/AppData/Local/Temp/`。
+ODT 启动后，`officectl` 会监视 prefix 中的 `NIXOS-*.log`，把当前 Click-to-Run 任务、阶段完成事件和阶段进度写到终端，例如：
+
+```text
+Office 安装阶段：下载并展开 O365BusinessRetail（zh-cn + en-us）数据…
+  当前阶段进度：下载并展开 O365BusinessRetail（zh-cn + en-us）数据 22%
+Office 阶段结束：下载并展开 O365BusinessRetail（zh-cn + en-us）数据。
+Office 安装阶段：应用 Office 程序和 zh-cn/en-us 语言组件…
+```
+
+这里显示的是具体安装阶段的进度，不是单独的网络下载字节比例。详细原始日志仍保存在 prefix 的 `drive_c/windows/` 和 `drive_c/users/*/AppData/Local/Temp/`。
 启动器保留宿主 Fontconfig 配置，使 NixOS / Home Manager 字体目录中的中日韩字体在 Windows 字体尚未装入 prefix 时也可回退显示。
 
 现有成功安装可直接接管，重复 `init` 只核验。非空但未通过验收的 prefix 会保留。
@@ -94,6 +171,44 @@ switch 的依赖闭包不包含这两个字体包、字体提取 VM 或 ISO。
 安装宋体、黑体、楷体、仿宋、等线和微软雅黑相关的 11 个字体文件，注册字体与 7 条中文名映射。
 字体复制进 prefix；运行时不依赖源 ISO 或提取包。重复执行可更新 / 修复注册。
 中文 locale 已由系统资源包提供。
+
+## 首次登录与激活（图解）
+
+安装完成后运行 `word365`，使用具有 Microsoft 365 授权的账户登录。以下步骤和截图迁自原 `office365-linux` 项目在 Wine4Office `0.2.2-beta.2` 下验证的流程；截图中的账户信息已打码。登录与激活由用户在 Office 界面中完成。
+
+### 1. 首次启动并登录
+
+```bash
+word365
+```
+
+在首次出现的登录界面中完成账户登录。旧流程中可能随后出现「出错了。(9zeuw)」或 “Microsoft 365 sign-in could not be completed”。若遇到这个对话框，点击「关闭」，然后关闭 Word，继续下一步。
+
+![首次登录后可能出现的 9zeuw 对话框](docs/images/wine4office-word-zh.png)
+
+### 2. 重新打开 Word
+
+再次运行 `word365`。旧流程中会再次出现「登录后即可开始使用 Word」，点击「登录或创建帐户」。
+
+![第二次启动 Word 的登录界面](docs/images/wine4office-word-zh-signin.png)
+
+### 3. 点击「创建一个」
+
+在随后出现的界面中，点击「没有帐户？创建一个!」。这是旧流程在已完成首次登录后触发许可证激活的已验证操作，随后等待许可协议界面出现。
+
+![登录界面中的创建一个入口](docs/images/wine4office-word-zh-login.png)
+
+### 4. 接受许可协议
+
+点击「接受」。旧流程中，接受协议后 Word 可能自动退出；此时重新运行 `word365` 即可。
+
+![接受 Microsoft 365 许可协议](docs/images/wine4office-word-zh-accept.png)
+
+### 5. 确认激活状态
+
+重新打开 Word，进入「文件 → 帐户」，确认显示「Microsoft 365」订阅产品及「管理帐户 / 切换许可证 / 更新许可证」。下图是旧流程完成激活后的账户页。
+
+![激活后的 Microsoft 365 订阅产品账户页](docs/images/wine4office-word-zh-activated.png)
 
 ## 启动应用和打开文件
 
